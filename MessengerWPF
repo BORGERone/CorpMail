@@ -1,0 +1,311 @@
+Код Main Window Клиента:
+
+
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Media;
+using Newtonsoft.Json;
+
+namespace MessengerClient
+{
+
+    public partial class MainWindow : Window
+    {
+        private TcpClient client;
+        private NetworkStream stream;
+        private Thread receiveThread;
+        private string clientName = "ClientName1"; // Замените на ваше имя клиента
+        private ObservableCollection<Message> messages = new ObservableCollection<Message>();
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            MessagesListBox.ItemsSource = messages;
+            ConnectToServer();
+        }
+
+        private void ConnectToServer()
+        {
+            client = new TcpClient("127.0.0.1", 1234);
+            stream = client.GetStream();
+            receiveThread = new Thread(ReceiveMessages);
+            receiveThread.Start();
+        }
+
+        private void ReceiveMessages()
+        {
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+
+            while (true)
+            {
+                bytesRead = 0;
+
+                try
+                {
+                    bytesRead = stream.Read(buffer, 0, buffer.Length);
+                }
+                catch
+                {
+                    // Обработка ошибок чтения
+                    break;
+                }
+
+                if (bytesRead > 0)
+                {
+                    string json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    ProcessJson(json);
+                }
+            }
+        }
+
+        private void ProcessJson(string json)
+        {
+            var receivedMessages = JsonConvert.DeserializeObject<List<Message>>(json);
+            if (receivedMessages != null)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    messages.Clear();
+                    foreach (var message in receivedMessages)
+                    {
+                        messages.Add(new Message
+                        {
+                            Text = message.Text,
+                            Alignment = message.Name == clientName ? HorizontalAlignment.Right : HorizontalAlignment.Left,
+                            BackgroundColor = message.Name == clientName ? "#0078D7" : "#333333"
+                        });
+                    }
+                    ScrollToBottom();
+                });
+            }
+        }
+
+        private void ScrollToBottom()
+        {
+            if (MessagesListBox.Items.Count > 0 && VisualTreeHelper.GetChildrenCount(MessagesListBox) > 0)
+            {
+                var border = (Border)VisualTreeHelper.GetChild(MessagesListBox, 0);
+                var scrollViewer = (ScrollViewer)VisualTreeHelper.GetChild(border, 0);
+                if (scrollViewer.VerticalOffset >= scrollViewer.ScrollableHeight)
+                {
+                    scrollViewer.ScrollToEnd();
+                }
+            }
+        }
+
+        private void SendButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!string.IsNullOrEmpty(MessageTextBox.Text))
+            {
+                var message = new Message
+                {
+                    Text = MessageTextBox.Text,
+                    Name = clientName,
+                    Alignment = HorizontalAlignment.Right,
+                    BackgroundColor = "#0078D7"
+                };
+
+                string json = JsonConvert.SerializeObject(message);
+                byte[] data = Encoding.UTF8.GetBytes(json);
+                stream.Write(data, 0, data.Length);
+                MessageTextBox.Clear();
+            }
+        }
+
+        private void Window_Closed(object sender, EventArgs e)
+        {
+            receiveThread?.Abort();
+            stream?.Close();
+            client?.Close();
+        }
+
+        public class SubtractMarginConverter : IValueConverter
+        {
+            public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
+            {
+                // Вычитаем отступы и границы из ширины ListBox
+                double totalWidth = (double)value;
+                return totalWidth - 20; // Предполагаем, что отступы и границы составляют 20 единиц
+            }
+
+            public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+            {
+                throw new NotImplementedException();
+            }
+        }
+
+    }
+}
+
+
+public class Message
+{
+    public string Text { get; set; }
+    public string Name { get; set; } // Имя отправителя сообщения
+    public HorizontalAlignment Alignment { get; set; }
+    public string BackgroundColor { get; set; }
+}
+
+
+
+Верстка XAML клиента:
+
+
+<Window x:Class="MessengerClient.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Messenger Client" Height="350" Width="525">
+    <Grid>
+        <ListBox x:Name="MessagesListBox" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Bottom">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="{Binding Alignment}">
+                        <Border Background="{Binding BackgroundColor}" Padding="10" CornerRadius="5">
+                            <TextBlock Text="{Binding Text}" Foreground="White" TextWrapping="Wrap"/>
+                        </Border>
+                    </StackPanel>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+        <TextBox x:Name="MessageTextBox" HorizontalAlignment="Stretch" Height="23" Margin="10" VerticalAlignment="Bottom"/>
+        <Button Content="Send" HorizontalAlignment="Right" Margin="10" VerticalAlignment="Bottom" Width="75" Click="SendButton_Click"/>
+    </Grid>
+</Window>
+
+
+Код серверного приложения:
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using Newtonsoft.Json;
+using System.Threading;
+
+public class Server
+{
+    private TcpListener tcpListener;
+    private List<TcpClient> clients = new List<TcpClient>();
+    private List<Message> messageHistory = new List<Message>(); // Изменено на список объектов Message
+
+    public Server(int port)
+    {
+        tcpListener = new TcpListener(IPAddress.Any, port);
+        tcpListener.Start();
+        StartAccept();
+    }
+
+    private void StartAccept()
+    {
+        tcpListener.BeginAcceptTcpClient(HandleAsyncConnection, tcpListener);
+    }
+
+    private void HandleAsyncConnection(IAsyncResult result)
+    {
+        StartAccept(); // Слушаем следующее входящее соединение
+        TcpClient client = tcpListener.EndAcceptTcpClient(result);
+        clients.Add(client);
+        Thread clientThread = new Thread(new ParameterizedThreadStart(HandleClient));
+        clientThread.Start(client);
+    }
+
+    private void HandleClient(object obj)
+    {
+        TcpClient client = (TcpClient)obj;
+        NetworkStream stream = client.GetStream();
+        byte[] buffer = new byte[1024];
+        int bytesRead;
+
+        while (true)
+        {
+            bytesRead = 0;
+
+            try
+            {
+                bytesRead = stream.Read(buffer, 0, buffer.Length);
+            }
+            catch
+            {
+                // Обработка ошибок чтения
+                break;
+            }
+
+            if (bytesRead == 0)
+            {
+                // Клиент отключился
+                break;
+            }
+
+            // Пересылка файла истории сообщений всем клиентам
+            string dataReceived = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+            Message receivedMessage = JsonConvert.DeserializeObject<Message>(dataReceived); // Десериализация в объект Message
+            if (receivedMessage != null)
+            {
+                messageHistory.Add(receivedMessage); // Добавление сообщения в историю
+                SaveHistoryToFile(); // Сохранение истории сообщений в файл
+                BroadcastMessageHistory(client);
+                SendUpdatedHistoryToClient(client);
+
+            }
+        }
+
+
+        clients.Remove(client);
+        client.Close();
+
+    }
+
+    private void SendUpdatedHistoryToClient(TcpClient client)
+    {
+        string json = File.ReadAllText("messageHistory.json");
+        byte[] buffer = Encoding.UTF8.GetBytes(json);
+        NetworkStream stream = client.GetStream();
+        stream.Write(buffer, 0, buffer.Length);
+    }
+
+    private void BroadcastMessageHistory(TcpClient originClient)
+    {
+        string json = File.ReadAllText("messageHistory.json");
+        byte[] buffer = Encoding.UTF8.GetBytes(json);
+
+        foreach (var client in clients)
+        {
+            if (client != originClient) // Не отправляем файл обратно клиенту, который его послал
+            {
+                NetworkStream stream = client.GetStream();
+                stream.Write(buffer, 0, buffer.Length);
+            }
+        }
+    }
+
+    private void SaveHistoryToFile()
+    {
+        string json = JsonConvert.SerializeObject(messageHistory, Formatting.Indented);
+        File.WriteAllText("messageHistory.json", json);
+    }
+
+    static void Main(string[] args)
+    {
+        Server server = new Server(1234); // Запуск сервера на порту 1234
+        Console.WriteLine("Сервер запущен и ожидает подключений...");
+        Console.ReadLine(); // Ожидание ввода для завершения программы
+    }
+}
+
+public class Message
+{
+    public string Name { get; set; }
+    public string Text { get; set; }
+}
+
